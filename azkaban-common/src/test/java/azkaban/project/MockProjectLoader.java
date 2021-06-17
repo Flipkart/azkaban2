@@ -18,10 +18,7 @@ package azkaban.project;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import azkaban.project.ProjectLogEvent.EventType;
 import azkaban.flow.Flow;
@@ -39,6 +36,12 @@ public class MockProjectLoader implements ProjectLoader {
 
   @Override
   public List<Project> fetchAllActiveProjects() throws ProjectManagerException {
+    // TODO Auto-generated method stub
+    return null;
+  }
+
+  @Override
+  public List<Project> fetchAllInactiveProjects() throws ProjectManagerException {
     // TODO Auto-generated method stub
     return null;
   }
@@ -200,6 +203,17 @@ public class MockProjectLoader implements ProjectLoader {
       throws ProjectManagerException {
     // TODO Auto-generated method stub
 
+  }
+
+  @Override
+  public void cleanProjectFiles(Project project) throws ProjectManagerException {
+    // TODO Auto-generated method stub
+  }
+
+  @Override
+  public Set<Integer> fetchProjectIdsByEventType(EventType eventType) throws ProjectManagerException {
+    // TODO Auto-generated method stub
+    return null;
   }
 
   @Override

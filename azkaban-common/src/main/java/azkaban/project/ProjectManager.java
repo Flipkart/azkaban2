@@ -18,14 +18,12 @@ package azkaban.project;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+import java.util.stream.Collectors;
 import java.util.zip.ZipFile;
 
 import org.apache.commons.io.FileUtils;
@@ -49,6 +47,8 @@ import azkaban.utils.Utils;
 public class ProjectManager {
   private static final Logger logger = Logger.getLogger(ProjectManager.class);
 
+  private static final long DEFAULT_RETENTION_MS = 31556952000L;
+
   private ConcurrentHashMap<Integer, Project> projectsById =
       new ConcurrentHashMap<Integer, Project>();
   private ConcurrentHashMap<String, Project> projectsByName =
@@ -57,6 +57,8 @@ public class ProjectManager {
   private final Props props;
   private final File tempDir;
   private final int projectVersionRetention;
+  private final long projectFilesRetentionMs;
+  private final long removedProjectRetentionMs;
   private final boolean creatorDefaultPermissions;
 
   public ProjectManager(ProjectLoader loader, Props props) {
@@ -67,6 +69,16 @@ public class ProjectManager {
         (props.getInt("project.version.retention", 3));
     logger.info("Project version retention is set to "
         + projectVersionRetention);
+
+    this.projectFilesRetentionMs =
+            (props.getLong("project.files.retention", DEFAULT_RETENTION_MS));
+    logger.info("Project files retention is set to "
+            + projectFilesRetentionMs);
+
+    this.removedProjectRetentionMs =
+            (props.getLong("removed.project.retention", DEFAULT_RETENTION_MS));
+    logger.info("Removed project retention is set to "
+            + removedProjectRetentionMs);
 
     this.creatorDefaultPermissions =
         props.getBoolean("creator.default.proxy", true);
@@ -86,12 +98,115 @@ public class ProjectManager {
     new XmlValidatorManager(prop);
     loadAllProjects();
     loadProjectWhiteList();
+
+    CleanerThread cleanerThread = new CleanerThread();
+    cleanerThread.start();
+  }
+
+  /**
+   * Cleaner thread to clean projects. Runs every day.
+  **/
+  private class CleanerThread extends Thread {
+
+    // runs every day
+    private static final long CLEANER_THREAD_WAIT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    private static final String DELETER = "azkaban";
+
+    private boolean shutdown = false;
+    private long lastProjectFileCleanTime = -1;
+    private long lastProjectCleanTime = -1;
+
+    public CleanerThread() {
+      this.setName("ProjectManager-Cleaner-Thread");
+      logger.info("Starting cleaner thread: " + this.getName());
+    }
+
+    @SuppressWarnings("unused")
+    public void shutdown() {
+      shutdown = true;
+      this.interrupt();
+    }
+
+    public void run() {
+      while (!shutdown) {
+        synchronized (this) {
+          try {
+            long currentTime = System.currentTimeMillis();
+
+            if (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectFileCleanTime) {
+              cleanProjectFilesAndRemoveProject();
+              lastProjectFileCleanTime = currentTime;
+            }
+
+            if (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectCleanTime) {
+              purgeRemovedProjects();
+              lastProjectCleanTime = currentTime;
+            }
+
+            logger.info("Cleaner Thread completed. Waiting!!!!!");
+            wait(CLEANER_THREAD_WAIT_INTERVAL_MS);
+          } catch (ProjectManagerException e) {
+            logger.error(this.getName() + "failed due to: " + e.getMessage());
+          } catch (InterruptedException e) {
+            logger.info("Interrupted. Probably to shut down.");
+          }
+        }
+      }
+    }
+
+    private void cleanProjectFilesAndRemoveProject() throws ProjectManagerException {
+      User deleter = new User(DELETER);
+      long currentTime = System.currentTimeMillis();
+
+      Set<Integer> scheduledProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.SCHEDULE);
+      logger.info("Scheduled Projects count: " + scheduledProjectIds.size());
+
+      List<Project> projects = projectsById.values()
+              .stream()
+              .filter(project -> !scheduledProjectIds.contains(project.getId()) &&
+                      currentTime - project.getLastModifiedTimestamp() > projectFilesRetentionMs)
+              .collect(Collectors.toList());
+
+      logger.info("Project files to clean: " + projects.size());
+
+      for(Project project : projects) {
+        logger.debug("Cleaning project files for project: " + project.getId());
+        projectLoader.cleanProjectFiles(project);
+        logger.debug("Removing project: " + project.getId());
+        removeProject(project, deleter);
+      }
+    }
+
+    private void purgeRemovedProjects() throws ProjectManagerException {
+      long currentTime = System.currentTimeMillis();
+
+      List<Project> inactiveProjects = projectLoader.fetchAllInactiveProjects();
+      logger.info("Inactive projects count: " + inactiveProjects.size());
+
+      Set<Integer> purgedProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.PURGE);
+      logger.info("Purged projects count: " + purgedProjectIds.size());
+
+      List<Project> projectsToPurge = inactiveProjects
+              .stream()
+              .filter(project -> !purgedProjectIds.contains(project.getId()) &&
+                      currentTime - project.getLastModifiedTimestamp() > removedProjectRetentionMs)
+              .collect(Collectors.toList());
+
+      logger.info("Projects to purge count: " + projectsToPurge.size());
+
+      User deleter = new User(DELETER);
+      for(Project project: projectsToPurge) {
+        logger.debug("Purging project: " + project.getId());
+        purgeProject(project, deleter);
+      }
+    }
   }
 
   private void loadAllProjects() {
     List<Project> projects;
     try {
       projects = projectLoader.fetchAllActiveProjects();
+      logger.info("Active projects count: " + projects.size());
     } catch (ProjectManagerException e) {
       throw new RuntimeException("Could not load projects from store.", e);
     }
@@ -208,7 +323,7 @@ public class ProjectManager {
     /**
      * Checks if a project is active using project_id
      *
-     * @param name
+     * @param id
      */
     public Boolean isActiveProject(int id) {
         return projectsById.containsKey(id);
