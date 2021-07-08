@@ -30,9 +30,7 @@ import org.apache.commons.io.FileUtils;
 import org.apache.log4j.Logger;
 
 import azkaban.flow.Flow;
-import azkaban.project.DirectoryFlowLoader;
 import azkaban.project.ProjectLogEvent.EventType;
-import azkaban.project.ProjectWhitelist.WhitelistType;
 import azkaban.project.validator.ValidationReport;
 import azkaban.project.validator.ValidationStatus;
 import azkaban.project.validator.ValidatorConfigs;
@@ -58,9 +56,12 @@ public class ProjectManager {
   private final File tempDir;
   private final int projectVersionRetention;
   private final long projectFilesRetentionMs;
-  private final long removedProjectRetentionMs;
+  private final long inactivatedProjectRetentionMs;
+  private final boolean projectFilesCleanupEnabled;
+  private final boolean inactivatedProjectCleanupEnabled;
   private final boolean creatorDefaultPermissions;
 
+  //TODO: Check if logs need to be changed since config names are changed
   public ProjectManager(ProjectLoader loader, Props props) {
     this.projectLoader = loader;
     this.props = props;
@@ -70,15 +71,30 @@ public class ProjectManager {
     logger.info("Project version retention is set to "
         + projectVersionRetention);
 
+    //Boolean value. Indicates if project files cleanup is enabled (Configured via project.files.retention.ms)
+    this.projectFilesCleanupEnabled =
+            (props.getBoolean("project.files.cleanup.enabled", true));
+    logger.info("Project cleanup enable is set to "
+            + projectFilesCleanupEnabled);
+
+    //Boolean value. Indicates if inactivates projects cleanup is enabled (Configured via inactivated.project.retention.ms)
+    this.inactivatedProjectCleanupEnabled =
+            (props.getBoolean("inactivated.project.cleanup.enabled", true));
+    logger.info("Project cleanup enable is set to "
+            + inactivatedProjectCleanupEnabled);
+
+    //Long value. Denotes the time in milliseconds after which project files will be removed for
+    //an active project and the project gets inactivated
     this.projectFilesRetentionMs =
-            (props.getLong("project.files.retention", DEFAULT_RETENTION_MS));
+            (props.getLong("project.files.retention.ms", DEFAULT_RETENTION_MS));
     logger.info("Project files retention is set to "
             + projectFilesRetentionMs);
 
-    this.removedProjectRetentionMs =
-            (props.getLong("removed.project.retention", DEFAULT_RETENTION_MS));
-    logger.info("Removed project retention is set to "
-            + removedProjectRetentionMs);
+    //Long value. Denotes the time in milliseconds after which inactivated projects get purged
+    this.inactivatedProjectRetentionMs =
+            (props.getLong("inactivated.project.retention.ms", DEFAULT_RETENTION_MS));
+    logger.info("Inactivated project retention is set to "
+            + inactivatedProjectRetentionMs);
 
     this.creatorDefaultPermissions =
         props.getBoolean("creator.default.proxy", true);
@@ -110,11 +126,11 @@ public class ProjectManager {
 
     // runs every day
     private static final long CLEANER_THREAD_WAIT_INTERVAL_MS = 24 * 60 * 60 * 1000;
-    private static final String DELETER = "azkaban";
+    private final User deleter = new User("azkaban");
 
     private boolean shutdown = false;
     private long lastProjectFileCleanTime = -1;
-    private long lastProjectCleanTime = -1;
+    private long lastDeactivatedProjectCleanTime = -1;
 
     public CleanerThread() {
       this.setName("ProjectManager-Cleaner-Thread");
@@ -129,33 +145,34 @@ public class ProjectManager {
 
     public void run() {
       while (!shutdown) {
-        synchronized (this) {
-          try {
+        try {
             long currentTime = System.currentTimeMillis();
 
-            if (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectFileCleanTime) {
-              cleanProjectFilesAndRemoveProject();
-              lastProjectFileCleanTime = currentTime;
+            if (projectFilesCleanupEnabled &&
+                    (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectFileCleanTime)) {
+                logger.info("Cleaning up project files");
+                cleanProjectFilesAndRemoveProject();
+                lastProjectFileCleanTime = currentTime;
             }
 
-            if (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectCleanTime) {
-              purgeRemovedProjects();
-              lastProjectCleanTime = currentTime;
+            if (inactivatedProjectCleanupEnabled &&
+                    (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastDeactivatedProjectCleanTime)) {
+                logger.info("Purging inactivated projects");
+                purgeRemovedProjects();
+                lastDeactivatedProjectCleanTime = currentTime;
             }
 
-            logger.info("Cleaner Thread completed. Waiting!!!!!");
-            wait(CLEANER_THREAD_WAIT_INTERVAL_MS);
-          } catch (ProjectManagerException e) {
+            logger.info("Cleaner Thread completed. Sleeping!!!!!");
+            sleep(CLEANER_THREAD_WAIT_INTERVAL_MS);
+        } catch (ProjectManagerException e) {
             logger.error(this.getName() + "failed due to: " + e.getMessage());
-          } catch (InterruptedException e) {
-            logger.info("Interrupted. Probably to shut down.");
-          }
+        } catch (Exception e) {
+            logger.info("Exception occurred. Probably to shut down.");
         }
       }
     }
 
     private void cleanProjectFilesAndRemoveProject() throws ProjectManagerException {
-      User deleter = new User(DELETER);
       long currentTime = System.currentTimeMillis();
 
       Set<Integer> scheduledProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.SCHEDULE);
@@ -167,12 +184,12 @@ public class ProjectManager {
                       currentTime - project.getLastModifiedTimestamp() > projectFilesRetentionMs)
               .collect(Collectors.toList());
 
-      logger.info("Project files to clean: " + projects.size());
+      logger.info("Project files to clean for: " + projects.size() + " projects");
 
       for(Project project : projects) {
-        logger.debug("Cleaning project files for project: " + project.getId());
+        logger.info("Cleaning project files for project: " + project.getId());
         projectLoader.cleanProjectFiles(project);
-        logger.debug("Removing project: " + project.getId());
+        logger.info("Removing project: " + project.getId());
         removeProject(project, deleter);
       }
     }
@@ -189,14 +206,13 @@ public class ProjectManager {
       List<Project> projectsToPurge = inactiveProjects
               .stream()
               .filter(project -> !purgedProjectIds.contains(project.getId()) &&
-                      currentTime - project.getLastModifiedTimestamp() > removedProjectRetentionMs)
+                      currentTime - project.getLastModifiedTimestamp() > inactivatedProjectRetentionMs)
               .collect(Collectors.toList());
 
       logger.info("Projects to purge count: " + projectsToPurge.size());
 
-      User deleter = new User(DELETER);
       for(Project project: projectsToPurge) {
-        logger.debug("Purging project: " + project.getId());
+        logger.info("Purging project: " + project.getId());
         purgeProject(project, deleter);
       }
     }

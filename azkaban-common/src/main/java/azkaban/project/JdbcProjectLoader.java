@@ -90,14 +90,11 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
   public List<Project> fetchAllInactiveProjects() throws ProjectManagerException {
     Connection connection = getConnection();
 
-    List<Project> projects = null;
     try {
-      projects = fetchAllInactiveProjects(connection);
+      return fetchAllInactiveProjects(connection);
     } finally {
       DbUtils.closeQuietly(connection);
     }
-
-    return projects;
   }
 
   private List<Project> fetchAllActiveProjects(Connection connection)
