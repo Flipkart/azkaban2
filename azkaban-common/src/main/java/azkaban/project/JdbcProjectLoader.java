@@ -1144,7 +1144,7 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
       return runner.query(ProjectIdsByEventTypeResultHandler.SELECT_PROJECTS_BY_EVENT_TYPE,
               handler, eventType.getNumVal());
     } catch (SQLException e) {
-      throw new ProjectManagerException("Error fetching projects by event type : " + eventType.name());
+      throw new ProjectManagerException("Error fetching projects by event type : " + eventType.name(), e);
     }
   }
 
