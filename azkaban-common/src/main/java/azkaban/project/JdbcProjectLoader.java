@@ -30,8 +30,10 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.commons.dbutils.DbUtils;
 import org.apache.commons.dbutils.QueryRunner;
@@ -84,6 +86,17 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
     return projects;
   }
 
+  @Override
+  public List<Project> fetchAllInactiveProjects() throws ProjectManagerException {
+    Connection connection = getConnection();
+
+    try {
+      return fetchAllInactiveProjects(connection);
+    } finally {
+      DbUtils.closeQuietly(connection);
+    }
+  }
+
   private List<Project> fetchAllActiveProjects(Connection connection)
       throws ProjectManagerException {
     QueryRunner runner = new QueryRunner();
@@ -109,6 +122,38 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
       }
     } catch (SQLException e) {
       throw new ProjectManagerException("Error retrieving all projects", e);
+    } finally {
+      DbUtils.closeQuietly(connection);
+    }
+
+    return projects;
+  }
+
+  private List<Project> fetchAllInactiveProjects(Connection connection)
+          throws ProjectManagerException {
+    QueryRunner runner = new QueryRunner();
+
+    ProjectResultHandler handler = new ProjectResultHandler();
+    List<Project> projects = null;
+    try {
+      projects =
+              runner.query(connection,
+                      ProjectResultHandler.SELECT_ALL_INACTIVE_PROJECTS, handler);
+
+      for (Project project : projects) {
+        List<Triple<String, Boolean, Permission>> permissions =
+                fetchPermissionsForProject(connection, project);
+
+        for (Triple<String, Boolean, Permission> entry : permissions) {
+          if (entry.getSecond()) {
+            project.setGroupPermission(entry.getFirst(), entry.getThird());
+          } else {
+            project.setUserPermission(entry.getFirst(), entry.getThird());
+          }
+        }
+      }
+    } catch (SQLException e) {
+      throw new ProjectManagerException("Error retrieving all inactive projects", e);
     } finally {
       DbUtils.closeQuietly(connection);
     }
@@ -1091,6 +1136,18 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
     }
   }
 
+  public Set<Integer> fetchProjectIdsByEventType(EventType eventType) throws ProjectManagerException {
+    QueryRunner runner = createQueryRunner();
+    ProjectIdsByEventTypeResultHandler handler = new ProjectIdsByEventTypeResultHandler();
+
+    try {
+      return runner.query(ProjectIdsByEventTypeResultHandler.SELECT_PROJECTS_BY_EVENT_TYPE,
+              handler, eventType.getNumVal());
+    } catch (SQLException e) {
+      throw new ProjectManagerException("Error fetching projects by event type : " + eventType.name(), e);
+    }
+  }
+
   @Override
   public void cleanOlderProjectVersion(int projectId, int version)
       throws ProjectManagerException {
@@ -1101,6 +1158,18 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
       cleanOlderProjectVersionProperties(connection, projectId, version);
       cleanOlderProjectFiles(connection, projectId, version);
       cleanOlderProjectVersion(connection, projectId, version);
+    } finally {
+      DbUtils.closeQuietly(connection);
+    }
+  }
+
+  @Override
+  public void cleanProjectFiles(Project project)
+          throws ProjectManagerException {
+    Connection connection = getConnection();
+
+    try {
+      cleanOlderProjectFiles(connection, project.getId(), project.getVersion() + 1);
     } finally {
       DbUtils.closeQuietly(connection);
     }
@@ -1202,6 +1271,9 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
     private static String SELECT_ALL_ACTIVE_PROJECTS =
         "SELECT id, name, active, modified_time, create_time, version, last_modified_by, description, enc_type, settings_blob FROM projects WHERE active=true";
 
+    private static String SELECT_ALL_INACTIVE_PROJECTS =
+        "SELECT id, name, active, modified_time, create_time, version, last_modified_by, description, enc_type, settings_blob FROM projects WHERE active=false";
+
     private static String SELECT_ACTIVE_PROJECT_BY_NAME =
         "SELECT id, name, active, modified_time, create_time, version, last_modified_by, description, enc_type, settings_blob FROM projects WHERE name=? AND active=true";
 
@@ -1260,6 +1332,29 @@ public class JdbcProjectLoader extends AbstractJdbcLoader implements
       } while (rs.next());
 
       return projects;
+    }
+  }
+
+  private static class ProjectIdsByEventTypeResultHandler implements
+          ResultSetHandler<Set<Integer>> {
+    private static final String SELECT_PROJECTS_BY_EVENT_TYPE =
+            "SELECT distinct(project_id) from project_events WHERE `event_type`=?";
+
+    @Override
+    public Set<Integer> handle(ResultSet rs)
+            throws SQLException {
+      if (!rs.next()) {
+        return Collections.<Integer> emptySet();
+      }
+
+      Set<Integer> projectIds =
+              new HashSet<Integer>();
+      do {
+        int project = rs.getInt(1);
+        projectIds.add(project);
+      } while (rs.next());
+
+      return projectIds;
     }
   }
 

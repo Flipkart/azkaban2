@@ -18,23 +18,19 @@ package azkaban.project;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
+import java.util.stream.Collectors;
 import java.util.zip.ZipFile;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.log4j.Logger;
 
 import azkaban.flow.Flow;
-import azkaban.project.DirectoryFlowLoader;
 import azkaban.project.ProjectLogEvent.EventType;
-import azkaban.project.ProjectWhitelist.WhitelistType;
 import azkaban.project.validator.ValidationReport;
 import azkaban.project.validator.ValidationStatus;
 import azkaban.project.validator.ValidatorConfigs;
@@ -49,6 +45,8 @@ import azkaban.utils.Utils;
 public class ProjectManager {
   private static final Logger logger = Logger.getLogger(ProjectManager.class);
 
+  private static final long DEFAULT_RETENTION_MS = 31556952000L;
+
   private ConcurrentHashMap<Integer, Project> projectsById =
       new ConcurrentHashMap<Integer, Project>();
   private ConcurrentHashMap<String, Project> projectsByName =
@@ -57,8 +55,13 @@ public class ProjectManager {
   private final Props props;
   private final File tempDir;
   private final int projectVersionRetention;
+  private final long projectFilesRetentionMs;
+  private final long inactivatedProjectRetentionMs;
+  private final boolean projectFilesCleanupEnabled;
+  private final boolean inactivatedProjectCleanupEnabled;
   private final boolean creatorDefaultPermissions;
 
+  //TODO: Check if logs need to be changed since config names are changed
   public ProjectManager(ProjectLoader loader, Props props) {
     this.projectLoader = loader;
     this.props = props;
@@ -67,6 +70,31 @@ public class ProjectManager {
         (props.getInt("project.version.retention", 3));
     logger.info("Project version retention is set to "
         + projectVersionRetention);
+
+    //Boolean value. Indicates if project files cleanup is enabled (Configured via project.files.retention.ms)
+    this.projectFilesCleanupEnabled =
+            (props.getBoolean("project.files.cleanup.enabled", true));
+    logger.info("Project cleanup enable is set to "
+            + projectFilesCleanupEnabled);
+
+    //Boolean value. Indicates if inactivates projects cleanup is enabled (Configured via inactivated.project.retention.ms)
+    this.inactivatedProjectCleanupEnabled =
+            (props.getBoolean("inactivated.project.cleanup.enabled", true));
+    logger.info("Project cleanup enable is set to "
+            + inactivatedProjectCleanupEnabled);
+
+    //Long value. Denotes the time in milliseconds after which project files will be removed for
+    //an active project and the project gets inactivated
+    this.projectFilesRetentionMs =
+            (props.getLong("project.files.retention.ms", DEFAULT_RETENTION_MS));
+    logger.info("Project files retention is set to "
+            + projectFilesRetentionMs);
+
+    //Long value. Denotes the time in milliseconds after which inactivated projects get purged
+    this.inactivatedProjectRetentionMs =
+            (props.getLong("inactivated.project.retention.ms", DEFAULT_RETENTION_MS));
+    logger.info("Inactivated project retention is set to "
+            + inactivatedProjectRetentionMs);
 
     this.creatorDefaultPermissions =
         props.getBoolean("creator.default.proxy", true);
@@ -86,12 +114,115 @@ public class ProjectManager {
     new XmlValidatorManager(prop);
     loadAllProjects();
     loadProjectWhiteList();
+
+    CleanerThread cleanerThread = new CleanerThread();
+    cleanerThread.start();
+  }
+
+  /**
+   * Cleaner thread to clean projects. Runs every day.
+  **/
+  private class CleanerThread extends Thread {
+
+    // runs every day
+    private static final long CLEANER_THREAD_WAIT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    private final User deleter = new User("azkaban");
+
+    private boolean shutdown = false;
+    private long lastProjectFileCleanTime = -1;
+    private long lastDeactivatedProjectCleanTime = -1;
+
+    public CleanerThread() {
+      this.setName("ProjectManager-Cleaner-Thread");
+      logger.info("Starting cleaner thread: " + this.getName());
+    }
+
+    @SuppressWarnings("unused")
+    public void shutdown() {
+      shutdown = true;
+      this.interrupt();
+    }
+
+    public void run() {
+      while (!shutdown) {
+        try {
+            long currentTime = System.currentTimeMillis();
+
+            if (projectFilesCleanupEnabled &&
+                    (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectFileCleanTime)) {
+                logger.info("Cleaning up project files");
+                cleanProjectFilesAndInactivateProject();
+                lastProjectFileCleanTime = currentTime;
+            }
+
+            if (inactivatedProjectCleanupEnabled &&
+                    (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastDeactivatedProjectCleanTime)) {
+                logger.info("Purging inactivated projects");
+                purgeInactivatedProjects();
+                lastDeactivatedProjectCleanTime = currentTime;
+            }
+
+            logger.info("Cleaner Thread completed. Sleeping!!!!!");
+            sleep(CLEANER_THREAD_WAIT_INTERVAL_MS);
+        } catch (ProjectManagerException e) {
+            logger.error(this.getName() + "failed due to: " + e.getMessage(), e);
+        } catch (Exception e) {
+            logger.error("Exception occurred. Probably to shut down.", e);
+        }
+      }
+    }
+
+    private void cleanProjectFilesAndInactivateProject() throws ProjectManagerException {
+      long currentTime = System.currentTimeMillis();
+
+      Set<Integer> scheduledProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.SCHEDULE);
+      logger.info("Scheduled Projects count: " + scheduledProjectIds.size());
+
+      List<Project> projects = projectsById.values()
+              .stream()
+              .filter(project -> !scheduledProjectIds.contains(project.getId()) &&
+                      currentTime - project.getLastModifiedTimestamp() > projectFilesRetentionMs)
+              .collect(Collectors.toList());
+
+      logger.info("Project files to clean for: " + projects.size() + " projects");
+
+      for(Project project : projects) {
+        logger.info("Cleaning project files for project: " + project.getId());
+        projectLoader.cleanProjectFiles(project);
+        logger.info("Removing project: " + project.getId());
+        removeProject(project, deleter);
+      }
+    }
+
+    private void purgeInactivatedProjects() throws ProjectManagerException {
+      long currentTime = System.currentTimeMillis();
+
+      List<Project> inactiveProjects = projectLoader.fetchAllInactiveProjects();
+      logger.info("Inactive projects count: " + inactiveProjects.size());
+
+      Set<Integer> purgedProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.PURGE);
+      logger.info("Purged projects count: " + purgedProjectIds.size());
+
+      List<Project> projectsToPurge = inactiveProjects
+              .stream()
+              .filter(project -> !purgedProjectIds.contains(project.getId()) &&
+                      currentTime - project.getLastModifiedTimestamp() > inactivatedProjectRetentionMs)
+              .collect(Collectors.toList());
+
+      logger.info("Projects to purge count: " + projectsToPurge.size());
+
+      for(Project project: projectsToPurge) {
+        logger.info("Purging project: " + project.getId());
+        purgeProject(project, deleter);
+      }
+    }
   }
 
   private void loadAllProjects() {
     List<Project> projects;
     try {
       projects = projectLoader.fetchAllActiveProjects();
+      logger.info("Active projects count: " + projects.size());
     } catch (ProjectManagerException e) {
       throw new RuntimeException("Could not load projects from store.", e);
     }
@@ -208,7 +339,7 @@ public class ProjectManager {
     /**
      * Checks if a project is active using project_id
      *
-     * @param name
+     * @param id
      */
     public Boolean isActiveProject(int id) {
         return projectsById.containsKey(id);

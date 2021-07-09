@@ -20,6 +20,7 @@ import java.io.File;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import azkaban.flow.Flow;
 import azkaban.project.ProjectLogEvent.EventType;
@@ -37,6 +38,14 @@ public interface ProjectLoader {
    * @throws ProjectManagerException
    */
   public List<Project> fetchAllActiveProjects() throws ProjectManagerException;
+
+  /**
+   * Returns all projects which are inactive
+   *
+   * @return
+   * @throws ProjectManagerException
+   */
+  public List<Project> fetchAllInactiveProjects() throws ProjectManagerException;
 
   /**
    * Loads whole project, including permissions, by the project id.
@@ -266,6 +275,22 @@ public interface ProjectLoader {
    */
   public void cleanOlderProjectVersion(int projectId, int version)
       throws ProjectManagerException;
+
+  /**
+   * Cleans project files
+   *
+   * @throws ProjectManagerException
+   */
+  public void cleanProjectFiles(Project project)
+          throws ProjectManagerException;
+
+  /**
+   * Fetches projects ids by event type
+   *
+   * @throws ProjectManagerException
+   */
+  public Set<Integer> fetchProjectIdsByEventType(EventType eventType)
+          throws ProjectManagerException;
 
   public void updateProjectProperty(Project project, Props props)
       throws ProjectManagerException;
