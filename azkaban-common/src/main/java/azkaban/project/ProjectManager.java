@@ -151,28 +151,28 @@ public class ProjectManager {
             if (projectFilesCleanupEnabled &&
                     (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastProjectFileCleanTime)) {
                 logger.info("Cleaning up project files");
-                cleanProjectFilesAndRemoveProject();
+                cleanProjectFilesAndInactivateProject();
                 lastProjectFileCleanTime = currentTime;
             }
 
             if (inactivatedProjectCleanupEnabled &&
                     (currentTime - CLEANER_THREAD_WAIT_INTERVAL_MS > lastDeactivatedProjectCleanTime)) {
                 logger.info("Purging inactivated projects");
-                purgeRemovedProjects();
+                purgeInactivatedProjects();
                 lastDeactivatedProjectCleanTime = currentTime;
             }
 
             logger.info("Cleaner Thread completed. Sleeping!!!!!");
             sleep(CLEANER_THREAD_WAIT_INTERVAL_MS);
         } catch (ProjectManagerException e) {
-            logger.error(this.getName() + "failed due to: " + e.getMessage());
+            logger.error(this.getName() + "failed due to: " + e.getMessage(), e);
         } catch (Exception e) {
-            logger.info("Exception occurred. Probably to shut down.");
+            logger.error("Exception occurred. Probably to shut down.", e);
         }
       }
     }
 
-    private void cleanProjectFilesAndRemoveProject() throws ProjectManagerException {
+    private void cleanProjectFilesAndInactivateProject() throws ProjectManagerException {
       long currentTime = System.currentTimeMillis();
 
       Set<Integer> scheduledProjectIds = projectLoader.fetchProjectIdsByEventType(EventType.SCHEDULE);
@@ -194,7 +194,7 @@ public class ProjectManager {
       }
     }
 
-    private void purgeRemovedProjects() throws ProjectManagerException {
+    private void purgeInactivatedProjects() throws ProjectManagerException {
       long currentTime = System.currentTimeMillis();
 
       List<Project> inactiveProjects = projectLoader.fetchAllInactiveProjects();
